@@ -12863,6 +12863,17 @@ def _render_index_shell_base() -> str:
     return base
 
 
+def _picker_preferences_response(handler, method, body=None):
+    from api.picker_bridge import get_preferences, update_preferences
+    from hermes_cli.picker_preferences import PreferenceConflict
+    try:
+        return j(handler, get_preferences() if method == 'GET' else update_preferences(body))
+    except PreferenceConflict as exc:
+        return bad(handler, str(exc), status=409)
+    except ValueError as exc:
+        return bad(handler, str(exc), status=500 if method == 'GET' else 400)
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
     proxy_result = _handle_extension_sidecar_proxy(handler, parsed, "GET")
@@ -13231,6 +13242,9 @@ def handle_get(handler, parsed) -> bool:
         j(handler, build_system_health_payload())
         return True
 
+    if parsed.path == "/api/model/preferences":
+        return _picker_preferences_response(handler, 'GET')
+
     if parsed.path == "/api/models":
         # Profile-scoping for non-default profiles (#3957) is handled INSIDE
         # get_available_models() — it binds the active profile's env + TLS on
@@ -13242,12 +13256,14 @@ def handle_get(handler, parsed) -> bool:
         try:
             diag.stage(f"enter:freshness={freshness or 'default'}") if diag else None
             if freshness == "session_visit":
-                result = get_available_models_for_session_visit()
+                from api.picker_bridge import get_inventory
+                result = get_inventory()
                 diag.stage("response_serialize") if diag else None
                 return j(handler, result)
             if freshness:
                 return bad(handler, f"unknown models freshness: {freshness}", status=400)
-            return j(handler, get_available_models())
+            from api.picker_bridge import get_inventory
+            return j(handler, get_inventory())
         finally:
             if diag:
                 diag.finish()
@@ -14978,6 +14994,14 @@ def handle_post(handler, parsed) -> bool:
 
     if diag:
         diag.stage("read_body")
+    if parsed.path == '/api/model/preferences':
+        from hermes_cli.picker_preferences import MAX_BODY_BYTES
+        try:
+            content_length = int(handler.headers.get('Content-Length', '0'))
+        except (ValueError, TypeError):
+            return bad(handler, 'Invalid Content-Length', status=400)
+        if content_length < 0 or content_length > MAX_BODY_BYTES:
+            return bad(handler, 'Preference payload too large', status=413)
     try:
         body = read_body(handler)
     except ValueError as exc:
@@ -14993,6 +15017,9 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.finish()
         return True
+
+    if parsed.path == "/api/model/preferences":
+        return _picker_preferences_response(handler, 'POST', body)
 
     if parsed.path == "/api/escape/authorize":
         return _handle_escape_authorize(handler, parsed, body)

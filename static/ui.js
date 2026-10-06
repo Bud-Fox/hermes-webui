@@ -2963,6 +2963,58 @@ window.addEventListener('visibilitychange',()=>{
 let _dynamicModelLabels={};
 window._configuredModelBadges=window._configuredModelBadges||{};
 const MODEL_STATE_KEY='hermes-webui-model-state';
+function _profileModelStateKey(){return MODEL_STATE_KEY+':'+encodeURIComponent(S.activeProfile||'default');}
+let _sharedPickerSync=null;
+let _sharedPickerCatalog=[];
+window.addEventListener('focus',()=>{if(_sharedPickerSync)void populateModelDropdown();});
+async function _loadSharedPicker(){
+  if(!window.HermesSharedPicker)throw new Error('Shared picker client unavailable');
+  if(!_sharedPickerSync)_sharedPickerSync=window.HermesSharedPicker.createSync(async(method,body)=>{
+    const res=await fetch(new URL('api/model/preferences',document.baseURI||location.href).href,{method,credentials:'include',headers:{'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});
+    if(!res.ok)throw new Error(res.status===409?'Picker preferences changed elsewhere. Reload and retry.':'Picker preferences request failed ('+res.status+')');
+    return res.json();
+  });
+  await _sharedPickerSync.load();
+}
+async function _saveSharedPicker(patch,expectedRevision){
+  try{await _sharedPickerSync.update(patch,expectedRevision);}
+  catch(error){alert(error.message);}
+  await populateModelDropdown();
+  if(typeof refreshSettingsSharedModels==='function')refreshSettingsSharedModels();
+}
+function _editSharedPicker(){
+  if(!_sharedPickerSync)return;
+  const state=_sharedPickerSync.state();
+  if(!state)return;
+  // Snapshot at open: Save always CASes against THIS revision, so a refresh that loaded another
+  // device's winner while the dialog was open makes Save conflict instead of overwriting it.
+  const catalog=_sharedPickerCatalog;
+  const dialog=document.createElement('dialog');
+  const title=document.createElement('h3');title.textContent='Shared models';dialog.appendChild(title);
+  const rows=[];
+  // Same resolver as the dropdown: checked == shown (fast families, featured/top-50, new models, hide-all).
+  for(const entry of window.HermesSharedPicker.editorRows(state,catalog)){
+    const line=document.createElement('label');line.style.display='block';
+    const box=document.createElement('input');box.type='checkbox';box.checked=entry.checked;
+    line.append(box,document.createTextNode(' '+entry.provider+' / '+entry.model));dialog.appendChild(line);rows.push({box,entry});
+    if(entry.custom){const remove=document.createElement('button');remove.textContent='Remove custom';remove.onclick=()=>{dialog.close();dialog.remove();void _saveSharedPicker({custom_models:state.custom_models.filter(row=>!(row.provider===entry.provider_id&&row.model===entry.model))},state.revision);};line.appendChild(remove);}
+  }
+  const provider=document.createElement('select');
+  for(const group of catalog){if(!group.provider_id)continue;const opt=document.createElement('option');opt.value=group.provider_id;opt.textContent=group.provider;provider.appendChild(opt);}
+  const typed=document.createElement('input');typed.placeholder='Custom model ID';typed.setAttribute('aria-label','Custom model ID');
+  dialog.append(provider,typed);
+  const save=document.createElement('button');save.textContent='Save shared models';
+  save.onclick=async()=>{
+    const changes=rows.filter(({box,entry})=>box.checked!==entry.checked).map(({box,entry})=>({provider:entry.provider_id,model:entry.model,checked:box.checked}));
+    const slug=typed.value.trim();
+    const patch=window.HermesSharedPicker.editorPatch(state,catalog,changes,slug&&!/\s/.test(slug)?{provider:provider.value,model:slug}:null);
+    dialog.close();dialog.remove();
+    if(patch)await _saveSharedPicker(patch,state.revision);
+  };
+  const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=()=>{dialog.close();dialog.remove();};
+  const reset=document.createElement('button');reset.textContent='Use catalog defaults';reset.onclick=()=>{dialog.close();dialog.remove();void _saveSharedPicker(window.HermesSharedPicker.resetPatch(state,catalog),state.revision);};
+  dialog.append(save,reset,cancel);document.body.appendChild(dialog);dialog.showModal();
+}
 const PENDING_SESSION_MODEL_PREFIX='hermes-webui-pending-session-model:';
 const PENDING_SESSION_MODEL_MAX_AGE_MS=10*60*1000;
 
@@ -3154,7 +3206,7 @@ function _providerQualifiedModelValueForSelect(sel, modelId){
 }
 function _readPersistedModelState(){
   try{
-    const raw=localStorage.getItem(MODEL_STATE_KEY);
+    const raw=localStorage.getItem(_profileModelStateKey())||(S.activeProfile==='default'?localStorage.getItem(MODEL_STATE_KEY):null);
     if(raw){
       const parsed=JSON.parse(raw);
       if(parsed&&parsed.model){
@@ -3165,7 +3217,7 @@ function _readPersistedModelState(){
       }
     }
   }catch(_){}
-  const legacy=localStorage.getItem('hermes-webui-model');
+  const legacy=S.activeProfile==='default'?localStorage.getItem('hermes-webui-model'):null;
   if(!legacy) return null;
   return {model:legacy,model_provider:_providerFromModelValue(legacy)||null};
 }
@@ -3173,18 +3225,18 @@ function _writePersistedModelState(model, modelProvider){
   const value=String(model||'').trim();
   const provider=modelProvider?String(modelProvider).trim():(_providerFromModelValue(value)||null);
   if(!value){
-    localStorage.removeItem('hermes-webui-model');
-    localStorage.removeItem(MODEL_STATE_KEY);
+    if(S.activeProfile==='default')localStorage.removeItem('hermes-webui-model');
+    localStorage.removeItem(_profileModelStateKey());
     return;
   }
-  localStorage.setItem('hermes-webui-model', value);
+  if(S.activeProfile==='default')localStorage.setItem('hermes-webui-model', value);
   try{
-    localStorage.setItem(MODEL_STATE_KEY, JSON.stringify({model:value,model_provider:provider||null}));
+    localStorage.setItem(_profileModelStateKey(), JSON.stringify({model:value,model_provider:provider||null}));
   }catch(_){}
 }
 function _clearPersistedModelState(){
-  localStorage.removeItem('hermes-webui-model');
-  localStorage.removeItem(MODEL_STATE_KEY);
+  if(S.activeProfile==='default')localStorage.removeItem('hermes-webui-model');
+  localStorage.removeItem(_profileModelStateKey());
 }
 function _pendingSessionModelKey(sessionId){
   return PENDING_SESSION_MODEL_PREFIX+String(sessionId||'');
@@ -3622,9 +3674,16 @@ async function populateModelDropdown(opts={}){
     };
 
     const usedConfiguredFallback=!(Array.isArray(data.groups)&&data.groups.length);
-    const groups=usedConfiguredFallback
+    let groups=usedConfiguredFallback
       ? _synthGroupsFromConfigured()
       : data.groups;
+    if(data.shared_picker){
+      await _loadSharedPicker();
+      if(requestSeq!==_modelDropdownRequestSeq)return;
+      _sharedPickerCatalog=groups;
+      groups=_sharedPickerSync.groups(groups);
+      if(typeof refreshSettingsSharedModels==='function')refreshSettingsSharedModels();
+    }
     const willRetry=usedConfiguredFallback && requestedFreshness!=='session_visit' && !_modelCatalogFallbackRetried;
 
     if(!groups.length){
@@ -3651,6 +3710,8 @@ async function populateModelDropdown(opts={}){
         const opt=document.createElement('option');
         opt.value=m.id;
         opt.textContent=m.label;
+        if(m.provider_id)opt.dataset.provider=m.provider_id;
+        if(m.model_id)opt.dataset.model=m.model_id;
         if(m && (m.supports_fast_tier === true || String(m.supports_fast_tier).toLowerCase()==='true')){
           opt.dataset.fast='1';
         }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
@@ -3685,7 +3746,7 @@ async function populateModelDropdown(opts={}){
     }
     // Kick off a background live-model fetch for the active provider.
     // This runs after the static list is already shown (no blocking flicker).
-    if(data.active_provider && !willRetry) _fetchLiveModels(data.active_provider, sel, requestSeq);
+    if(data.active_provider && !willRetry && !data.shared_picker) _fetchLiveModels(data.active_provider, sel, requestSeq);
     if(willRetry){
       _modelCatalogFallbackRetried=true;
       populateModelDropdown({...opts,freshness:'session_visit'}).catch(()=>{});
@@ -4434,6 +4495,16 @@ function renderModelDropdown(){
     const providerChip=(_plainGroup&&withProviderChip)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
     row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${_selectedModelBadge(m)}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
     row.onclick=()=>selectFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+    if(_sharedPickerSync&&!m.endpointErrorOnly){
+      const option=Array.from(sel.options).find(opt=>opt.value===m.value);
+      const provider=option?.dataset.provider||m.providerId;
+      const model=option?.dataset.model||m.value.slice(('@'+provider+':').length);
+      const identity=window.HermesSharedPicker.key(provider,model);
+      const star=document.createElement('button');star.type='button';star.setAttribute('aria-label','Toggle favorite '+model);
+      star.textContent=_sharedPickerSync.state().favorites.includes(identity)?'★':'☆';
+      star.onclick=event=>{event.stopPropagation();const favorites=_sharedPickerSync.state().favorites;void _saveSharedPicker({favorites:favorites.includes(identity)?favorites.filter(k=>k!==identity):[...favorites,identity]});};
+      row.appendChild(star);
+    }
     return row;
   };
   const _expandOverflowGroup=(groupMetaEntry)=>{
@@ -4553,6 +4624,16 @@ function renderModelDropdown(){
     const providerChip=(_plainGroup&&!_underOwnHeading)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
     row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${_selectedModelBadge(m)}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
     row.onclick=()=>selectFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+    if(_sharedPickerSync&&!m.endpointErrorOnly){
+      const option=Array.from(sel.options).find(opt=>opt.value===m.value);
+      const provider=option?.dataset.provider||m.providerId;
+      const model=option?.dataset.model||m.value.slice(('@'+provider+':').length);
+      const identity=window.HermesSharedPicker.key(provider,model);
+      const star=document.createElement('button');star.type='button';star.setAttribute('aria-label','Toggle favorite '+model);
+      star.textContent=_sharedPickerSync.state().favorites.includes(identity)?'★':'☆';
+      star.onclick=event=>{event.stopPropagation();const favorites=_sharedPickerSync.state().favorites;void _saveSharedPicker({favorites:favorites.includes(identity)?favorites.filter(k=>k!==identity):[...favorites,identity]});};
+      row.appendChild(star);
+    }
     return row;
   };
   const _filterModels=(term)=>{
@@ -4621,6 +4702,7 @@ function renderModelDropdown(){
     ).length;
     dd.innerHTML='';
     dd.appendChild(_scopeNote);
+    if(_sharedPickerSync){const edit=document.createElement('button');edit.type='button';edit.textContent='Edit shared models';edit.onclick=_editSharedPicker;dd.appendChild(edit);}
     dd.appendChild(_searchRow);
     dd.appendChild(_custSep);
     dd.appendChild(_custRow);
@@ -4836,7 +4918,20 @@ function renderModelDropdown(){
   _si.addEventListener('click',e=>e.stopPropagation());
   _sc.onclick=()=>{ _si.value=''; _filterModels(''); _si.focus(); };
   _sc.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){ _si.value=''; _filterModels(''); _si.focus(); e.preventDefault(); }});
-  const _applyCustom=()=>{const v=_ci.value.trim();if(!v)return;selectFromDropdown(v,null);_ci.value='';};
+  const _applyCustom=async()=>{
+    const v=_ci.value.trim();if(!v)return;
+    if(_sharedPickerSync){
+      const state=_sharedPickerSync.state();
+      const provider=_getOptionProviderId(sel.selectedOptions?.[0])||window._activeProvider;
+      if(!provider){alert('Choose a provider before adding a custom model.');return;}
+      try{await _sharedPickerSync.update(window.HermesSharedPicker.addCustomPatch(state,_sharedPickerCatalog,provider,v),state.revision);}
+      catch(error){alert(error.message);return;}
+      selectFromDropdown(v,provider);
+      await populateModelDropdown();
+      if(typeof refreshSettingsSharedModels==='function')refreshSettingsSharedModels();
+    }else selectFromDropdown(v,null);
+    _ci.value='';
+  };
   _cb.onclick=_applyCustom;
   _ci.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();_applyCustom();}if(e.key==='Escape'){closeDropdown();}});
   _ci.addEventListener('click',e=>e.stopPropagation());
@@ -4877,6 +4972,7 @@ async function toggleModelDropdown(){
   if(!dd||!chip||!sel) return;
   const open=dd.classList.contains('open');
   if(open){closeModelDropdown(); return;}
+  if(_sharedPickerSync)await populateModelDropdown();
   if(typeof closeProfileDropdown==='function') closeProfileDropdown();
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   if(typeof closeReasoningDropdown==='function') closeReasoningDropdown();

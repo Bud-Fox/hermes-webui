@@ -479,10 +479,12 @@ def get_config() -> dict:
     # correctly suppressed the reload.
     try:
         if cfg is not _cfg_cache:
-            return cfg
+            from api.picker_bridge import effective_config
+            return effective_config(cfg)
     except NameError:
         pass
-    return _cfg_cache
+    from api.picker_bridge import effective_config
+    return effective_config(_cfg_cache)
 
 
 def get_config_snapshot() -> dict:
@@ -501,7 +503,8 @@ def get_config_snapshot() -> dict:
             active_cfg = cfg if cfg is not _cfg_cache else _cfg_cache
         except NameError:
             active_cfg = _cfg_cache
-        return copy.deepcopy(active_cfg)
+        from api.picker_bridge import effective_config
+        return effective_config(copy.deepcopy(active_cfg))
 
 
 def get_webui_session_save_mode(config_data: dict | None = None) -> str:
@@ -2566,6 +2569,14 @@ def _parse_provider_qualified_model_id(model_id: str) -> tuple[str, str] | None:
     if not candidate.startswith("@") or ":" not in candidate:
         return None
     inner = candidate[1:]
+    from api.picker_bridge import effective_config
+    shared_providers = effective_config(get_config()).get('providers', {})
+    if isinstance(shared_providers, dict):
+        # Longest literal provider prefix wins; model tags are not delimiters.
+        for provider in sorted(shared_providers, key=len, reverse=True):
+            prefix = str(provider) + ':'
+            if inner.startswith(prefix):
+                return inner[len(prefix):], provider
     provider_hint, bare_model = inner.rsplit(":", 1)
     if provider_hint.startswith("custom:") and provider_hint.count(":") >= 2:
         _slug_rest = provider_hint[len("custom:"):]
@@ -6203,6 +6214,7 @@ def _models_cache_source_fingerprint() -> dict:
         "config_yaml": _models_cache_file_fingerprint(_get_config_path()),
         "auth_json": _auth_store_semantic_fingerprint(_get_auth_store_path()),
         "catalog": _models_cache_catalog_fingerprint(),
+        "shared_catalog": __import__('api.picker_bridge', fromlist=['catalog_signature']).catalog_signature(),
     }
 
 
