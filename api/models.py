@@ -5014,7 +5014,8 @@ def _profile_default_model_state(profile=None):
     try:
         from api.profiles import get_hermes_home_for_profile
         config_path = Path(get_hermes_home_for_profile(profile)) / "config.yaml"
-        config_data = _cfg._load_yaml_config_file(config_path)
+        from api.picker_bridge import effective_config
+        config_data = effective_config(_cfg._load_yaml_config_file(config_path))
     except Exception:
         config_data = {}
 

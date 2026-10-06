@@ -9038,6 +9038,31 @@ function _syncSettingsMaxTokensPlaceholder(field, fallbackValue){
     : 'No override';
 }
 
+function refreshSettingsSharedModels(){
+  const select=$('settingsModel');
+  if(!select||!_sharedPickerSync)return;
+  // Shared presentation edits never change an unsaved profile default choice.
+  const value=select.value;
+  const selected=select.selectedOptions[0]?.cloneNode(true);
+  select.replaceChildren();
+  for(const group of _sharedPickerSync.groups(_sharedPickerCatalog)){
+    const og=document.createElement('optgroup');og.label=group.provider;
+    if(group.provider_id)og.dataset.provider=group.provider_id;
+    for(const model of group.models||[]){
+      const opt=document.createElement('option');opt.value=model.id;opt.textContent=model.label||model.model_id;
+      opt.dataset.model=model.model_id;
+      if(model.provider_id)opt.dataset.provider=model.provider_id;
+      if(model.supports_fast_tier!==undefined)opt.dataset.fast=model.supports_fast_tier?'1':'0';
+      og.appendChild(opt);
+    }
+    select.appendChild(og);
+  }
+  if(value&&!Array.from(select.options).some(opt=>opt.value===value)&&selected)select.appendChild(selected);
+  select.value=value;
+  if(typeof mountSettingsModelPicker==='function')mountSettingsModelPicker();
+  if(typeof syncSettingsModelChip==='function')syncSettingsModelChip();
+}
+
 async function loadSettingsPanel(){
   try{
     const settings=await api('/api/settings');
@@ -9273,6 +9298,11 @@ async function loadSettingsPanel(){
       let models=null;
       try{
         models=await api('/api/models');
+        if(models.shared_picker&&typeof _loadSharedPicker==='function'){
+          await _loadSharedPicker();
+          _sharedPickerCatalog=models.groups||[];
+          models={...models,groups:_sharedPickerSync.groups(models.groups||[])};
+        }
         for(const g of ((models||{}).groups||[])){
           const og=document.createElement('optgroup');
           og.label=g.provider;
@@ -9280,6 +9310,8 @@ async function loadSettingsPanel(){
           for(const m of [...(g.models||[]),...(g.extra_models||[])]){
             const opt=document.createElement('option');
             opt.value=m.id;opt.textContent=m.label;
+            if(m.model_id)opt.dataset.model=m.model_id;
+            if(m.provider_id)opt.dataset.provider=m.provider_id;
             if(m && (m.supports_fast_tier === true || String(m.supports_fast_tier).toLowerCase()==='true')){
               opt.dataset.fast='1';
             }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
@@ -9291,7 +9323,7 @@ async function loadSettingsPanel(){
         }
         // Append live-fetched models for the active provider, same as the
         // chat-header dropdown does via _fetchLiveModels() (#872).
-        if(models.active_provider && typeof _fetchLiveModels==='function'){
+        if(models.active_provider && !models.shared_picker && typeof _fetchLiveModels==='function'){
           _fetchLiveModels(models.active_provider, modelSel);
         }
       }catch(e){}
